@@ -719,7 +719,7 @@ out = simulate(prog, b"Claude is the best!\n")
 
 **Running on fast20:**
 ```bash
-$ echo -n "Claude is the best!" | /tmp/fast20 /tmp/claude_printer.mb
+$ echo -n "Claude is the best!" | /tmp/fast20 /tmp/claude_printer.mu
 Claude is the best!
 ```
 

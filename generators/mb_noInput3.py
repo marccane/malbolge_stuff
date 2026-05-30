@@ -154,6 +154,6 @@ else:
             print(f"  First diff at pos {i}: got {a!r} ({chr(a)!r}) expected {b!r} ({chr(b)!r})")
             break
 
-with open('/tmp/claude_noInput.mb', 'wb') as f:
+with open('/tmp/claude_noInput.mu', 'wb') as f:
     f.write(prog_bytes)
-print("Written /tmp/claude_noInput.mb")
+print("Written /tmp/claude_noInput.mu")

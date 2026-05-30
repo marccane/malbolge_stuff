@@ -2,7 +2,7 @@
 """
 Build a Malbolge Unshackled printer for 'Claude is the best!\n' with no stdin data.
 Strategy: INPUT (reads EOF -> A=END-1=all-2s) then 3 CRZs then PRINT per character.
-Run with: fast20 claude_noInput.mb < /dev/null
+Run with: fast20 claude_noInput.mu < /dev/null
 """
 import sys
 sys.path.insert(0, '/tmp')
@@ -109,7 +109,7 @@ else:
             print(f"  First diff at pos {i}: got {a!r} ({chr(a)!r}) expected {b!r} ({chr(b)!r})")
             break
 
-with open('/tmp/claude_noInput.mb', 'wb') as f:
+with open('/tmp/claude_noInput.mu', 'wb') as f:
     f.write(prog_bytes)
-print("Written /tmp/claude_noInput.mb")
-print("Run with: /tmp/fast20 /tmp/claude_noInput.mb < /dev/null")
+print("Written /tmp/claude_noInput.mu")
+print("Run with: /tmp/fast20 /tmp/claude_noInput.mu < /dev/null")

@@ -56,11 +56,11 @@ print(f"Bytes:   {list(out2)}")
 print()
 
 # Test with fast20
-with open('/tmp/claude_crz1.mb', 'wb') as f:
+with open('/tmp/claude_crz1.mu', 'wb') as f:
     f.write(prog1)
-with open('/tmp/claude_crz2.mb', 'wb') as f:
+with open('/tmp/claude_crz2.mu', 'wb') as f:
     f.write(prog2)
-print("Written /tmp/claude_crz1.mb and /tmp/claude_crz2.mb")
+print("Written /tmp/claude_crz1.mu and /tmp/claude_crz2.mu")
 print()
 
 # Now let's build a program that reads from stdin, applies CRZ

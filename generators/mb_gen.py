@@ -24,7 +24,7 @@ if __name__ == "__main__":
     print(f"Generated {len(prog)}-byte straight-line INPUT/PRINT program", file=sys.stderr)
     print(f"Target string: {repr(s)}", file=sys.stderr)
 
-    out_path = "/tmp/claude_printer.mb"
+    out_path = "/tmp/claude_printer.mu"
     with open(out_path, "wb") as f:
         f.write(prog)
     print(f"Written to {out_path}", file=sys.stderr)

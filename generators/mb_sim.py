@@ -89,7 +89,7 @@ def encode_char(opcode, pos):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: mb_sim.py <prog.mb> [input_string]", file=sys.stderr)
+        print("Usage: mb_sim.py <prog.mu> [input_string]", file=sys.stderr)
         sys.exit(1)
     with open(sys.argv[1], "rb") as f:
         prog = f.read()

@@ -125,7 +125,7 @@ if __name__ == "__main__":
     print(f"          input '{iy_ch}' ({iy}) → V_final={V_Y} → branch at pos {V_Y+1} (PRINT '{chr(V_Y)}')")
 
     prog, pa, pb = build_program(fb1, ix, iy, V_X, V_Y)
-    out_path = '/tmp/branch/branch_v3.mb'
+    out_path = '/tmp/branch/branch_v3.mu'
     with open(out_path, 'wb') as f:
         f.write(prog)
     print(f"\nWrote {len(prog)} bytes to {out_path}")

@@ -162,7 +162,7 @@ def simulate(prog_bytes, input_bytes=b"", max_steps=2_000_000, trace=False):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: word_sim.py <prog.mb> [input_string]", file=sys.stderr)
+        print("Usage: word_sim.py <prog.mu> [input_string]", file=sys.stderr)
         sys.exit(1)
     with open(sys.argv[1], "rb") as f:
         prog = f.read()
