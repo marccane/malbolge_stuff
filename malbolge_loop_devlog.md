@@ -824,3 +824,147 @@ Naive recursive Fibonacci in MalbolgeLISP. fib(5) = 5 ✓. (fib(8) exceeds pract
 | **MalbolgeLISP** | Full first-class functions: `defun`, `lambda`, HOFs (`map`, `filter`, `fold`), partial application (`bind`), closures, recursion |
 
 The only practical path to functions in Malbolge Unshackled is through MalbolgeLISP or a similar high-level language compiled by the Nagoya University toolchain.
+
+---
+
+## 14. Inline ROTR and Magic-Number Division by 3
+
+Section 1 mentioned in passing that fast20's `rotate_r` performs "tritwise rotation with no division, using modular multiplicative inverses discovered by the compiler." This section unpacks what that means.
+
+### 14.1 What ROTR is doing
+
+The Malbolge Unshackled ROTR instruction takes a non-negative integer below `END = 3^19` (a 19-trit number) and rotates its trits one position to the right: the bottom trit becomes the top trit, everything else shifts down.
+
+In `fast20.c`, the value is stored across three fields of a `Word`:
+
+```c
+typedef struct Word {
+    unsigned int area;   // 1 "trit" (values 0,1,2)
+    unsigned int high;   // 10 trits  (values 0..59048)
+    unsigned int low;    // 10 trits  (values 0..59048)
+} Word;
+```
+
+The Unshackled spec says 19 trits; the layout here uses 10+10+1 = 21 slots of capacity, with the upper trits intentionally not all reachable — the representation is sparse but easier to manipulate.
+
+`rotate_r` only touches the `high`/`low` pair (the `area` trit is left alone — it isn't part of the rotated digit chain):
+
+```c
+static inline Word rotate_r(Word d) {
+    unsigned int carry_h = d.high % 3;
+    unsigned int carry_l = d.low  % 3;
+    d.high = 19683 * carry_l + ((unsigned int) d.high) / 3;
+    d.low  = 19683 * carry_h + ((unsigned int) d.low ) / 3;
+    return d;
+}
+```
+
+Read it as "right-shift each 10-trit limb by one trit, and feed each limb's discarded bottom trit into the other limb's top position":
+
+| operation                       | meaning in trit-terms                          |
+|---------------------------------|------------------------------------------------|
+| `d.high / 3`                    | drop trit 0 of `high`; trits 1..9 move down    |
+| `19683 * carry_l`               | place trit 0 of `low` into position 9 of `high` (`3^9 = 19683`) |
+| `d.low / 3`                     | drop trit 0 of `low`; trits 1..9 move down     |
+| `19683 * carry_h`               | place trit 0 of `high` into position 9 of `low` |
+
+Picture the trits laid out 0..19, with `low` = trits 0..9 and `high` = trits 10..19. The combined effect is:
+
+- trit 0     → trit 19  (rotation wrap-around)
+- trit 1..9  → trit 0..8  (shift inside `low`)
+- trit 10    → trit 9   (carry crossing the limb boundary)
+- trit 11..19 → trit 10..18 (shift inside `high`)
+
+So every trit moved exactly one position down, and the bottom one wrapped to the top. That's a right rotation of a 20-trit number, matching the Unshackled spec.
+
+Why split the work into two limbs? Because `3^20` doesn't fit comfortably into a 32-bit register's "wide multiply by small constant" patterns, and because the splitting matches the memory layout that `crazy()` and `ptr_to()` already use (everything is keyed by `(area, high, low)`). Keeping limbs around 10 trits each means `high` and `low` always stay `< 3^10 = 59049`, well within `uint32_t`.
+
+### 14.2 What you actually want from the compiler
+
+Both `% 3` and `/ 3` are operations on a runtime value (`d.high`, `d.low`) where the *divisor* is a compile-time constant (3). General integer division is one of the slowest instructions on x86 — `div r32` is ~20–40 cycles. But *division by a constant* can be turned into a multiply + shift, which is ~3–5 cycles. The compiler does this transformation automatically, and the mathematics behind it is what people mean by "magic number division" or (more grandly) division via *modular multiplicative inverses*.
+
+The disassembly of `/tmp/fast20` shows it everywhere:
+
+```asm
+mov   r15d, 0xaaaaaaab          ; magic constant for /3 (32-bit)
+imul  r14,  r15                 ; 64-bit multiply
+shr   r14,  0x21                ; >> 33 — now r14 == original / 3
+lea   r14d, [r15+r15*2]         ; r14 = (r14/3) * 3
+sub   r13d, r14d                ; r13 -= 3*(r13/3)  → r13 == original % 3
+```
+
+That five-instruction snippet is exactly `x % 3`, computed without ever executing a `div`. The constant `0xAAAAAAAB` appears 9× in the binary, plus the 64-bit variant `0xAAAAAAAAAAAAAAAB` twice.
+
+### 14.3 What is a "modular multiplicative inverse"?
+
+If you fix a modulus `M` and pick an integer `a`, then `a⁻¹ mod M` is the integer `b` (if one exists) such that
+
+```
+a · b ≡ 1   (mod M)
+```
+
+It exists exactly when `gcd(a, M) = 1`. It's "the number that undoes multiplication by `a` in modular arithmetic."
+
+Two flavours show up in compilers:
+
+#### 14.3.1 The exact inverse (for exact division)
+
+When `a` divides `x` evenly, `x / a` can be computed as `x · a⁻¹ mod 2^N` (where N is the register width, e.g. 32 or 64). Reason: working modulo `2^N` is exactly what fixed-width unsigned integer multiplication gives you for free, and `(a · a⁻¹) ≡ 1` means multiplying by `a⁻¹` "cancels" an `a`.
+
+For `a = 3`, the inverse mod `2^32` is `0xAAAAAAAB` (= `(2^33 + 1) / 3`). Sanity check: `3 · 0xAAAAAAAB mod 2^32 = 0x100000001 mod 2^32 = 1`. ✓
+
+This trick is exact *only* when `a | x`. If `a` doesn't divide `x` evenly, you get garbage — useful for the divisibility test `(x * 0xAAAAAAAB) < 0x55555556` (≈ "is this `< ⌈2^32/3⌉`?"), but not for general division.
+
+#### 14.3.2 Granlund–Montgomery (for general division by a constant)
+
+For general unsigned division by a positive constant `d`, the trick of Granlund and Montgomery (1994) finds a magic multiplier `m` and a shift `s` such that
+
+```
+floor(x / d)  =  (x · m) >> s     for all x in [0, 2^N)
+```
+
+The shape is:
+
+1. Pick the smallest `ℓ ≥ ⌈log2 d⌉` such that `2^(N+ℓ)` slightly exceeds a multiple of `d` — concretely, pick `ℓ` so that `m = ⌈2^(N+ℓ) / d⌉` fits in `N+1` bits.
+2. Then `(x · m) >> (N + ℓ)` equals `floor(x / d)`.
+
+The "+ℓ extra bits" matter because for some `d` you really do need an (N+1)-bit magic; in that case the compiler emits a slightly longer sequence (add-with-carry, then shift). For `d = 3`, `N = 32`, you can get away with an N-bit magic and shift = 33:
+
+```
+m = ⌈2^33 / 3⌉ = ⌈8589934592 / 3⌉ = 2863311531 = 0xAAAAAAAB
+floor(x / 3) = (x * 0xAAAAAAAB) >> 33
+```
+
+Then `x % 3` is one `lea`+`sub` away: `x % 3 = x - 3 * (x / 3)`, exactly the pattern in the assembly above.
+
+For the 64-bit version the compiler picks `0xAAAAAAAAAAAAAAAB` (= ⌈2^65/3⌉ adjusted to fit), uses `mul rbx` to get a 128-bit product in `rdx:rax`, and shifts `rdx` right by 1 — that's what you see at addresses `0x2102` and `0x30d7` in the binary.
+
+This generalises: 9, 27, 81, 243 all get their own magic numbers. The disassembly of `/tmp/fast20` also shows `imul …,…,0x38e38e39` (the div-by-9 magic) and powers of three like `0x81bf1 = 3^12` and `0x4ce3 = 3^9 = 19683` — the latter being the explicit multiplier in `rotate_r` itself.
+
+### 14.4 How the compiler "discovers" them
+
+This is a compile-time computation, not a runtime one — every modern back-end has a small library implementing it. The canonical reference is *Hacker's Delight* (Warren), chapter 10. The algorithm for unsigned `d`:
+
+```
+Find the smallest p ≥ N such that  2^p mod d  ≤  2^(p-N)
+Then  m = (2^p + d - (2^p mod d)) / d
+And   x / d == (x · m) >> p
+```
+
+In words: start with `p = N` and keep growing `p` by one until you find a shift big enough that *rounding up* `2^p / d` produces a multiplier which is correct for every `x` in `[0, 2^N)`. The proof relies on the fact that the error introduced by ceiling-rounding `2^p / d` is at most `1 / d`, and that error is amplified by `x < 2^N`, giving a total error `< 2^N / d ≤ 1` for `p` large enough.
+
+GCC implements this in `gcc/expmed.cc` (`choose_multiplier()`); LLVM's version lives in `llvm/lib/Support/DivisionByConstantInfo.cpp` (`UnsignedDivisionByConstantInfo::get`). Both produce the same magic number for the same divisor; differences in emitted code are choices about how to materialise the multiplier and the post-shift (e.g. when the multiplier needs N+1 bits, GCC tends to emit an `add; shift` sequence and LLVM tends to emit a `mulhi; sub; shr; add; shr` sequence — same answer, different surface form).
+
+The signed case is slightly trickier — you have to adjust for the sign of `x` with an arithmetic shift — but the same `⌈2^p / d⌉` idea drives it.
+
+There's also a much older, simpler trick for `mod 3` specifically: since `4 ≡ 1 (mod 3)`, any number written in base 4 has the property that its digit sum mod 3 equals the number itself mod 3. So you can compute `x % 3` by adding up pairs of bits and recursing. Compilers don't normally use this because it's more instructions than the magic-multiply path, but it's a nice piece of folklore worth knowing.
+
+### 14.5 Why this matters for fast20
+
+ROTR runs millions of times in any non-trivial Malbolge Unshackled program (the MalbolgeLISP interpreter, for instance, leans on it heavily during arithmetic and memory addressing). Replacing two `idiv` instructions (each ~30 cycles) with two `imul/shr/lea/sub` sequences (each ~6 cycles) per call is a ~5× speedup on this one primitive — and it happens entirely for free, with no source-level change. The author wrote `d.low % 3` and `d.low / 3` and let the compiler do the algebra.
+
+Quick verification, if you want to confirm by hand:
+
+- `pow(3, -1, 2**32) == 0xAAAAAAAB` in Python (the exact inverse mod 2³²).
+- `((x * 0xAAAAAAAB) >> 33) == x // 3` for any `x` in `range(2**32)` (try `0`, `1`, `2`, `2**31`, `2**32 - 1`).
+- `objdump -d /tmp/fast20 | grep -B1 -A4 'aaaaaaab' | head -40` shows the `imul / shr / lea / sub` pattern Section 14.2 describes.
