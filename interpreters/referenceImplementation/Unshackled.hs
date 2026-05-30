@@ -352,7 +352,7 @@ vCheck _ = True
 
 io = liftIO :: IO a -> UMonad a
 
-crash = error $! show $ foldl' (^) (2 :: Integer) $ cycle [2]
+crash = error "cannot apply xlat2"
 hang = error $! show $ foldl' (+) 0 $ cycle [-1,1]
 
 -- Errors that shouldn't be possible.
