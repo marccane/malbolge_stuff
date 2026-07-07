@@ -1,0 +1,8 @@
+[submodule "LMFAO"]
+	path = LMFAO
+	url = https://github.com/esoteric-programmer/LMFAO.git
+	ignore = untracked
+[submodule "elvm"]
+	path = elvm
+	url = https://github.com/shinh/elvm.git
+	ignore = untracked

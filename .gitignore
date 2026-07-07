@@ -1,3 +1,9 @@
 *.o
 *.hi
 *__pycache__*
+
+# ELVM/LMFAO experiment artifacts (regenerable): compiled .mu/.eir/.hell, traces, logs, binaries
+elvm_experiments/build/
+elvm_experiments/.err_*
+elvm_experiments/tio_hack/*
+!elvm_experiments/tio_hack/*.c
