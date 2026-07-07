@@ -968,3 +968,217 @@ Quick verification, if you want to confirm by hand:
 - `pow(3, -1, 2**32) == 0xAAAAAAAB` in Python (the exact inverse mod 2³²).
 - `((x * 0xAAAAAAAB) >> 33) == x // 3` for any `x` in `range(2**32)` (try `0`, `1`, `2`, `2**31`, `2**32 - 1`).
 - `objdump -d /tmp/fast20 | grep -B1 -A4 'aaaaaaab' | head -40` shows the `imul / shr / lea / sub` pattern Section 14.2 describes.
+
+## 15. Branching, Flags, and the Data-Only Flag Idiom
+
+Up to here we have programs that read input and echo or transform it, and programs that produce fixed output with no input. The natural next question — *can a Malbolge Unshackled program do **different** things depending on its input?* — turns out to surface essentially every interesting wart of the language at once. This section documents what we learned building `dotmu/branch_flag.mu` (input `'Y'` → print `'R'`; input `'N'` → print `'$'`), and how to use the same techniques to build your own.
+
+### 15.1 The shape of the problem
+
+Malbolge Unshackled has exactly one control-flow primitive: opcode `4`, **JMP**. It is *unconditional*. There is no "branch if equal", no "skip if zero", no compare-and-jump. JMP just sets `c := mem[d]` (interpreted as a Word, i.e. an address), and the next step decodes whatever lives at that new `c`.
+
+So the whole question "how do I make this program do different things depending on its input?" reduces to:
+
+> **How do I arrange for `mem[d]` to hold a *different Word* when the JMP fires, depending on what the user typed?**
+
+That cell — the one the JMP reads — is the *flag*. Computing the flag is the interesting part; the JMP itself is mechanical.
+
+### 15.2 What can write to the flag?
+
+Three opcodes mutate memory:
+
+| op | name | effect on `mem[d]`                                                  |
+|----|------|---------------------------------------------------------------------|
+| 39 | ROTR | rotate the trits of `mem[d]` right by one; also `a ← mem[d]`        |
+| 40 | MOVD | does **not** write — sets `d ← mem[d]`                              |
+| 62 | CRZ  | `mem[d] ← crazy(a, mem[d])`; also `a ← same`                         |
+
+ROTR has no input dependence (it just rotates whatever was already there). MOVD doesn't write at all. That leaves CRZ as the only opcode that can compute a flag value as a function of `A` — and `A` is the only register that ever depends on input (via INPUT, op 23). The general shape of a branching program is therefore:
+
+```
+INPUT       — load some input into a
+CRZ-chain   — fold a together with predetermined data bytes to produce a flag
+JMP         — jump to the cell whose address is the flag value
+```
+
+The rest of this section is the *details* needed to make that work in practice.
+
+### 15.3 The 2-CRZ self-cancellation trick
+
+A single CRZ on a freshly-loaded input cell gives a Word with garbage in the upper limbs.
+
+After `INPUT` of byte `B`, `a = (area=0, high=0, low=B)`. Suppose `mem[d]` holds the data byte `fb1`, i.e. `mem[d] = (0, 0, fb1)`. One CRZ produces:
+
+| field | new value                                                |
+|-------|----------------------------------------------------------|
+| area  | `crz[0 + 3·0] = crz[0] = 1`                              |
+| high  | `crazy_low(0, 0) = 29524` (each trit pair `(0,0)` → `OPR[0][0] = 1`, summing `1+3+9+…+3⁹`) |
+| low   | `crazy_low(B, fb1)` — call this `V₁`                     |
+
+So `mem[d]` is now `(1, 29524, V₁)`. If we JMP to *this* Word, we land at area 1, page 29524 — deep in lazy-fill memory, whose contents differ between interpreters (Section 8). Useless.
+
+The trick: do a **second** CRZ on this Word, with itself. After CRZ #1, both `a` and `mem[d]` hold the same Word `(1, 29524, V₁)`. CRZ #2 with the same `d` computes `crazy(a, a)` — *self*-CRZ — which has a special structure because `OPR[t][t] ∈ {0, 1}`:
+
+| field | new value                                          |
+|-------|----------------------------------------------------|
+| area  | `crz[1 + 3·1] = crz[4] = 0`                        |
+| high  | each trit pair `(1, 1)` → `OPR[1][1] = 0` → sum is `0` |
+| low   | `crazy_low(V₁, V₁)` — call this `V_final`          |
+
+Now `mem[d] = (0, 0, V_final)`. That's a clean, low-memory, area-0 address — exactly what JMP needs. **The 2-CRZ chain is the workhorse of the idiom.**
+
+### 15.4 Which `V_final` values are reachable?
+
+`crazy_low(V₁, V₁)` is self-CRZ trit by trit. The diagonal of OPR:
+
+```
+OPR[0][0] = 1     OPR[1][1] = 0     OPR[2][2] = 1
+```
+
+So every trit of `V_final` is in `{0, 1}` — `V_final` is a "binary number written in base 3", i.e. a sum of distinct powers of 3. There are `2¹⁰ = 1024` such 10-trit values in `[0, 29524]`.
+
+Our branch region is `[2, 97]`, so we need `V_final + 1 ∈ [2, 97]`, i.e. `V_final ∈ [1, 96]`. The 12 candidates in that window are:
+
+```
+{36, 37, 39, 40, 81, 82, 84, 85, 90, 91, 93, 94}
+```
+
+Each is a sum of powers of 3 from `{1, 3, 9, 27, 81}`. For example, `36 = 27 + 9`, `82 = 81 + 1`, `94 = 81 + 9 + 3 + 1`.
+
+This is your **branch-destination alphabet**. A program of this exact shape can therefore have **at most 12 distinct branches**. The character printed at branch destination `V+1` is just `V` itself, because at PRINT time `a = (0, 0, V_final)`.
+
+### 15.5 The MOVD-redirect pattern
+
+For the 2-CRZ trick to work, CRZ must run with `d = K` (the flag-cell address) regardless of where the CRZ *instruction* sits in the file. By default `d == c` (both monotonically advance by 1 each step), so we need to *move* `d`.
+
+`MOVD` does this: it sets `d ← mem[d]` (reading the Word at the current `d`). To make `d` become `K` after a MOVD step, plant the byte `K-1` at some file position `p`, and arrange the program so that `d == p` when the MOVD fires. Then MOVD sets `d` to the Word `(0, 0, K-1)`, and the post-instruction increment bumps it to `K`. The next instruction sees `d = K`.
+
+Two notes:
+
+- The byte the MOVD reads (`K-1`) is in `[33, 126]` because `K ∈ [34, 127]` is a comfortable choice. For our `K = 34`, the redirect byte is `33` (the `'!'` character).
+- The MOVD *instruction itself* can sit at any `c` position — only `d` matters when MOVD fires. Since `d` is essentially the step counter (offset by INPUT/JMP behavior), you control which file position the MOVD reads from by choosing how many NOPs precede it.
+
+In our final layout:
+
+```
+step  c   d   instruction      effect
+ 5   101   5  NOP              c=102, d=6
+ 6   102   6  MOVD#1           reads mem[6]=33; sets d=33, then +1 → d=34
+ 7   103  34  CRZ#1            crazy at d=34 — writes (1,29524,V₁) to mem[34]
+ 8   104  35  MOVD#2           reads mem[35]=33; again d=34
+ 9   105  34  CRZ#2            self-CRZ — writes (0,0,V_final) to mem[34]
+10   106  35  MOVD#3           reads mem[35]=33; again d=34
+11   107  34  JMP#2            c ← mem[34] = (0,0,V_final); lands at V_final+1
+```
+
+Note that MOVD doesn't *modify* `mem[d]`, so `mem[35]` is still `33` when MOVD#3 runs after MOVD#2 already read it.
+
+### 15.6 The data-only flag-cell discipline
+
+The flag cell at `K=34` and the redirect cells at `6` and `35` must **never be executed as instructions**. Two reasons:
+
+**1. Post-CRZ XLAT garbage.** After CRZ writes to `mem[K]`, its `low` limb is whatever `crazy_low(a, fb1)` produces — a 10-trit value typically *outside* `[33, 126]`. If `c` ever reaches `K`, the post-instruction XLAT step does `XLAT[mem[K].low - 33]`, which is out of bounds:
+- `fast20` silently reads garbage past the table (undefined behavior, but the program tends to keep limping along).
+- Lutter's `tio_unshackled` aborts with `cannot apply xlat2` (`unshackled.c:367-372`).
+- The reference Haskell originally entered an infinite computation in its `crash` handler (`Unshackled.hs:355`, since fixed in this repo to actually crash).
+
+**2. Loader rejection.** Spec interpreters check at load time that every byte decodes to one of the eight valid opcodes at its position (`unshackled.c:629-648`, `Unshackled.hs:91-92`). The redirect byte `33` only passes this check at certain positions: `pos mod 94 ∈ {6, 7, 29, 35, 48, 65, 66, 84}` — derived from `(33 + pos) mod 94 ∈ {4, 5, 23, 39, 40, 62, 68, 81}`. The same constraint applies to `fb1` at position 34.
+
+To dodge both: put data cells in a region `c` never enters. Our recipe is `JMP#1` at pos 1, which unconditionally lands at pos 98 — making positions `[2, 97]` dead to `c`. We park redirect bytes at `6` and `35`, the flag cell at `34`, and the per-input PRINT/HALT cells at `V_final+1, V_final+2`, all inside that window. Every other position in `[2, 97]` is filled with `encode_char(68, p)` — a NOP encoding that is never executed but still passes the loader's validity check.
+
+### 15.7 Picking a valid `fb1`
+
+`fb1` lives at position 34. The byte must satisfy `(fb1 + 34) mod 94 ∈ {4, 5, 23, 39, 40, 62, 68, 81}`, which solves to
+
+```
+fb1 ∈ {34, 47, 64, 65, 83, 99, 100, 122}
+```
+
+For each candidate `fb1`, the V_final values for any chosen input pair are determined by
+
+```
+V₁(input)      = crazy_low(input, fb1)
+V_final(input) = crazy_low(V₁(input), V₁(input))
+```
+
+The build script enumerates `(fb1, input_X, input_Y)` and picks the first combination where both `V_final` values are in the 12-element reachable set, distinct, and non-overlapping (`|V_X − V_Y| ≥ 2`, so `{V_X+1, V_X+2, V_Y+1, V_Y+2}` are four distinct positions).
+
+`fb1 = 34` (the `"` character) works for inputs `'Y'/'N'` → `V_final = 82 / 36`, producing the printable characters `R` and `$`. That's the canonical solution the script outputs.
+
+### 15.8 The whole 108-byte program in one glance
+
+```
+pos      byte           purpose
+-------  -------------  -------------------------------------------------------
+ 0       INPUT          read a single input byte into a
+ 1       JMP#1          unconditional; lands at 98 — skips the data/branch region
+ 2-97                   "skip region" — never visited by c
+           6 : 33       MOVD#1 redirect data       (= K-1 for K=34)
+          34 : fb1=34   CRZ flag cell              (input-dependent post-CRZ)
+          35 : 33       MOVD#2 / MOVD#3 redirect   (same as pos 6)
+          83 : PRINT    branch for 'Y' (V_final=82)
+          84 : HALT
+          37 : PRINT    branch for 'N' (V_final=36)
+          38 : HALT
+        rest: NOP fillers (encode_char(68, p)), never executed
+98-101   NOP            filler; c lands at 98 after JMP#1
+102      MOVD#1         d ← 34
+103      CRZ#1          a, mem[34] = (1, 29524, V₁)
+104      MOVD#2         d ← 34
+105      CRZ#2          a, mem[34] = (0, 0, V_final)  (self-CRZ cancellation)
+106      MOVD#3         d ← 34
+107      JMP#2          c ← mem[34]; lands at V_final + 1
+```
+
+Execution trace:
+
+```
+Y: INPUT→a=(0,0,89) → CRZ#1→mem[34]=(1,29524,V₁(89,34))
+                    → CRZ#2→mem[34]=(0,0,V_final(89,34)=82)
+                    → JMP →c=83 → PRINT 'R' (82) → HALT
+N: …                → JMP →c=37 → PRINT '$' (36) → HALT
+```
+
+### 15.9 Recipe — design your own branching program
+
+To make a similar program with different inputs or different printed characters:
+
+1. **Decide on the inputs** you want to discriminate. Two printable characters `X` and `Y` is the basic case. (`'\n'` and EOF take special A values — Section 12 — so they require more care.)
+
+2. **Pick a flag-cell address `K`.** Any `K` inside the skip region `[2, 97]` works, as long as `K` doesn't collide with a branch destination's PRINT/HALT pair and you can plant the redirect byte `K-1` at a position that passes the loader's validity check. The default `K = 34` is convenient because it sits between the data-cell positions `6` and `35`.
+
+3. **Solve for `fb1`.** Enumerate the `fb1` values valid at `K` (see 15.7). For each, compute `V_final(X, fb1)` and `V_final(Y, fb1)` via the two `crazy_low` calls. Accept any triple `(fb1, V_X, V_Y)` where both V's are in `VALID_V`, distinct, and `|V_X - V_Y| ≥ 2`.
+
+4. **Place the branches.** PRINT at `V_X+1`, HALT at `V_X+2`; same for Y. The character printed is `V_final` itself — pick V values whose ASCII you actually want.
+
+5. **Lay out the linear code.** INPUT at pos 0, JMP#1 at pos 1 (which always lands at 98), four NOPs, then `MOVD#1 / CRZ#1 / MOVD#2 / CRZ#2 / MOVD#3 / JMP#2`. With this exact prefix, `d` at MOVD#1 is `6` and `d` at MOVD#2/#3 is `35`. If you change the prefix length, those positions shift — recompute the step counter.
+
+6. **Plant the data.** Byte `K-1` at the redirect positions; `fb1` at `K`; PRINT/HALT at the branch positions; `encode_char(68, p)` everywhere else in the skip region.
+
+7. **Validate.** Confirm every byte `b` at every position `p` satisfies `(b + p) mod 94 ∈ {4, 5, 23, 39, 40, 62, 68, 81}`. The build script asserts this in `is_valid_byte_at(...)`.
+
+The generator at `generators/branch_flag_build.py` does steps 1–7. To produce a different variant, edit `PREFERRED_PAIRS` to list the input pairs you want to try; the script picks the first one that solves cleanly, builds the `.mu`, runs it through `word_sim`, and tests it against all three interpreters.
+
+A companion exploration tool at `generators/enumerate_branches.py` enumerates all `(fb1, input_X, input_Y → char_X, char_Y)` combinations so you can see at a glance which input characters map to which printable outputs.
+
+### 15.10 Extensions
+
+- **More than two branches.** Up to 12 distinct branches fit in `[2, 97]` (one per `V_final` in `VALID_V`). For N inputs, brute-force `(fb1, x₁, …, x_N)` such that the N `V_final` values are all distinct and all in `VALID_V`. The search is `8 × 94^N`, comfortable for `N ≤ 4`.
+
+- **Wider output alphabet.** The 12 `V_final` values map to the printable characters `$ % ' ( Q R T U Z [ ] ^`. You can't get other characters from this exact 2-CRZ shape — but adding more CRZs, or a ROTR between them, expands the reachable set. ROTR multiplies the trit pattern by a cyclic permutation; combined with CRZ chains you can sculpt almost any printable output.
+
+- **Comparing two inputs.** Two `INPUT`s separated by CRZs give you a flag that depends on `f(input_1, input_2)`. The pattern is the same; just add more INPUT steps and more CRZs before the JMP.
+
+- **Loops.** A loop is a backward JMP. The catch: cells written along the loop body retain their post-CRZ garbage forever, so you have to design `d`-paths that never re-read polluted cells (or accept that they'll re-XLAT-fail on spec interpreters). The same "polluted-set" tracking that `mb_noInput5.py` does for the no-input printer (Section 15.11) applies.
+
+### 15.11 The XLAT-pollution constraint, in one rule
+
+Across all the spec-compliant programs we've built, the single rule that drives the design is:
+
+> **After every step, the byte at the new `c` position must be in `[33, 126]`.**
+
+Two consequences:
+- If `c == d` when CRZ fires, the CRZ result lands at `mem[c]`. Its low limb is *almost never* in `[33, 126]`. So `c == d` at a CRZ step is forbidden on spec interpreters. The MOVD-redirect pattern is precisely what dodges this.
+- The same applies if `c` ever reaches a cell that a previous CRZ wrote to. The data-only flag-cell discipline (`c` never enters the skip region) and the polluted-set tracking in `mb_noInput5.py` are two different ways to enforce this.
+
+This is the central insight: in Malbolge Unshackled, you don't think about *what each instruction does* nearly as much as you think about *where `c` will be next* and *whether the byte there will still be in range*. Every program is a careful dance to keep `c` walking only on cells that are still safe to XLAT.

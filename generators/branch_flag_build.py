@@ -1,143 +1,184 @@
 #!/usr/bin/env python3
-"""Final flag-idiom branching program (v3, clean).
+"""Spec-compliant flag-idiom branching program for Malbolge Unshackled.
 
-Layout (cells executed in linear flow first, then post-JMP):
-  pos 0:    INPUT
-  pos 1:    JMP#1 — skips branch region (always lands at 98)
-  pos 2-97: branch region (only executed via JMP#2 below)
-            - PRINT+HALT at V_final_X+1, V_final_X+2 (input X branch)
-            - PRINT+HALT at V_final_Y+1, V_final_Y+2 (input Y branch)
-            - All other positions: NOPs
-  pos 98-100:  NOPs (filler, executed after JMP#1)
-  pos 101:  MOVD#1 — redirects d to 34 (reads mem[5]=33 → d=33+1=34)
-  pos 102:  CRZ#1  — writes mem[34] = crazy(input, fb1) = (1, 29524, V1)
-  pos 103-194: NOPs (92 NOPs)
-  pos 195:  MOVD#2 — redirects d to 34 (reads mem[127]=33 → d=34)
-  pos 196:  CRZ#2  — writes mem[34] = crazy(A=(1,29524,V1), (1,29524,V1)) = (0, 0, V_final)
-  pos 197-288: NOPs (92 NOPs)
-  pos 289:  MOVD#3 — redirects d to 34 (reads mem[127]=33 → d=34)
-  pos 290:  JMP#2  — reads mem[34]=(0,0,V_final); lands at V_final+1 (in branch region)
+Earlier versions of this build script were valid only for fast20-flavored
+interpreters: data cells held bytes that did not decode to one of the eight
+valid opcodes at their positions, which the strict loaders in Lutter's C
+interpreter and the Haskell reference (tio_unshackled / Unshackled.hs) reject
+at load time.
 
-Critical data cells (overridden):
-  mem[5]   = 33  (MOVD#1 redirect data)
-  mem[34]  = fb1 (initial value for the input-dependent CRZ chain)
-  mem[127] = 33  (MOVD#2 and MOVD#3 redirect data)
+This redesign keeps every program byte spec-compliant by putting all data
+cells inside the JMP#1-skipped region [2, 97] (so they never get XLAT'd) and
+by picking flag-cell values fb1 so they decode to a valid opcode at pos 34.
 
-V_final values for our inputs must land at branch positions in [2, 97].
+Layout (steps in linear flow):
+  step  c=pos  instruction
+  ----  -----  -----------
+   0      0    INPUT
+   1      1    JMP#1            (jumps to 98)
+   2-5  98-101 4 × NOP
+   6     102   MOVD#1           reads mem[d=6]  = 33  → d := 34
+   7     103   CRZ#1            mem[34] := crazy(a, fb1) = (1, 29524, V1)
+   8     104   MOVD#2           reads mem[d=35] = 33  → d := 34
+   9     105   CRZ#2            mem[34] := crazy(a, (1,29524,V1)) = (0,0,V_final)
+   10    106   MOVD#3           reads mem[d=35] = 33  → d := 34
+   11    107   JMP#2            c := mem[34] = (0,0,V_final); lands at V_final+1
+   12    V+1   PRINT            outputs a.low = V_final
+   13    V+2   HALT
+
+Data cells (all in [2, 97], never visited by c, hence never XLAT'd):
+  mem[6]  = 33   (33+6)%94 = 39 (ROTR — valid opcode encoding, never executed)
+  mem[34] = fb1  picked so (fb1+34)%94 ∈ {valid opcodes}
+  mem[35] = 33   (33+35)%94 = 68 (NOP encoding, never executed)
+
+Branch cells (placed inside [2, 97], populated post-JMP#2):
+  mem[V_X+1] PRINT, mem[V_X+2] HALT  (input X branch)
+  mem[V_Y+1] PRINT, mem[V_Y+2] HALT  (input Y branch)
+
+V_final ∈ {36,37,39,40,81,82,84,85,90,91,93,94} (10-trit values whose trits
+are all in {0,1}), so V_final+1 lands inside the skipped branch region.
 """
+
 import sys, subprocess
-sys.path.insert(0, '/tmp/branch')
-sys.path.insert(0, '/tmp')
+
+# Make the simulator importable
+sys.path.insert(0, '/home/markus/projects/malbolge_stuff/generators')
 from word_sim import simulate, encode_char
 
 
+VALID_OPCODES = {4, 5, 23, 39, 40, 62, 68, 81}
+VALID_V = {36, 37, 39, 40, 81, 82, 84, 85, 90, 91, 93, 94}
+
+
 def crazy_low(a, d, n=10):
-    crz = [[1,1,2],[0,0,2],[0,2,1]]
+    crz = [[1, 1, 2], [0, 0, 2], [0, 2, 1]]
     r, k = 0, 1
     for _ in range(n):
         r += k * crz[a % 3][d % 3]
-        a //= 3; d //= 3; k *= 3
+        a //= 3
+        d //= 3
+        k *= 3
     return r
 
 
+def is_valid_byte_at(byte, pos):
+    return 33 <= byte <= 126 and (byte + pos) % 94 in VALID_OPCODES
+
+
+def valid_fb1_at(pos):
+    return sorted({b for b in range(33, 127) if is_valid_byte_at(b, pos)})
+
+
 def v_finals(fb1, ix, iy):
-    V1_X = crazy_low(ix, fb1)
-    V1_Y = crazy_low(iy, fb1)
-    return crazy_low(V1_X, V1_X), crazy_low(V1_Y, V1_Y)
+    V1x = crazy_low(ix, fb1)
+    V1y = crazy_low(iy, fb1)
+    return crazy_low(V1x, V1x), crazy_low(V1y, V1y)
+
+
+FLAG_ADDR = 34
+PREFERRED_PAIRS = [
+    ('0', '1'), ('1', '0'),
+    ('a', 'b'), ('b', 'a'),
+    ('A', 'B'), ('B', 'A'),
+    ('y', 'n'), ('Y', 'N'),
+    ('+', '-'),
+    ('1', '2'), ('2', '1'),
+]
 
 
 def find_solution():
-    """Find (fb1, ix, iy) where V_final_X, V_final_Y are different, both V+1 in [2, 97]."""
-    valid_v_set = {36, 37, 39, 40, 81, 82, 84, 85, 90, 91, 93, 94}
-    # Prefer natural input pairs
-    preferred_pairs = [
-        ('0','1'), ('1','0'), ('a','b'), ('b','a'), ('A','B'), ('B','A'),
-        ('y','n'), ('Y','N'), ('+','-'), ('1','2'), ('2','1'),
-    ]
-    for fb1 in range(33, 127):
-        for ix_ch, iy_ch in preferred_pairs:
+    """Find (fb1, ix, iy, V_X, V_Y, ix_ch, iy_ch). fb1 must be valid at FLAG_ADDR."""
+    fb1_candidates = valid_fb1_at(FLAG_ADDR)
+    for fb1 in fb1_candidates:
+        for ix_ch, iy_ch in PREFERRED_PAIRS:
             ix, iy = ord(ix_ch), ord(iy_ch)
             V_X, V_Y = v_finals(fb1, ix, iy)
-            if V_X in valid_v_set and V_Y in valid_v_set and V_X != V_Y:
-                # Check branches don't overlap
-                pa, pb = V_X + 1, V_Y + 1
-                if abs(pa - pb) >= 2:
-                    return fb1, ix, iy, V_X, V_Y, ix_ch, iy_ch
-    # Fallback: any inputs
-    for fb1 in range(33, 127):
+            if V_X in VALID_V and V_Y in VALID_V and V_X != V_Y \
+                    and abs(V_X - V_Y) >= 2:
+                return fb1, ix, iy, V_X, V_Y, ix_ch, iy_ch
+    # Fallback: any printable input pair
+    for fb1 in fb1_candidates:
         for ix in range(33, 127):
             for iy in range(33, 127):
-                if ix == iy: continue
+                if ix == iy:
+                    continue
                 V_X, V_Y = v_finals(fb1, ix, iy)
-                if V_X in valid_v_set and V_Y in valid_v_set and V_X != V_Y:
-                    pa, pb = V_X + 1, V_Y + 1
-                    if abs(pa - pb) >= 2:
-                        return fb1, ix, iy, V_X, V_Y, chr(ix), chr(iy)
+                if V_X in VALID_V and V_Y in VALID_V and V_X != V_Y \
+                        and abs(V_X - V_Y) >= 2:
+                    return fb1, ix, iy, V_X, V_Y, chr(ix), chr(iy)
     return None
 
 
-def build_program(fb1, ix, iy, V_X, V_Y):
-    """Build the program file."""
-    pa = V_X + 1
-    pb = V_Y + 1
-    N = 300
+def build_program(fb1, V_X, V_Y):
+    N = 108
+    prog = [encode_char(68, p) for p in range(N)]  # NOPs by default
 
-    # All NOPs by default
-    prog = [encode_char(68, p) for p in range(N)]
+    # Linear flow instructions
+    prog[0]   = encode_char(23, 0)     # INPUT
+    prog[1]   = encode_char(4, 1)      # JMP#1 → 98
+    prog[102] = encode_char(40, 102)   # MOVD#1
+    prog[103] = encode_char(62, 103)   # CRZ#1
+    prog[104] = encode_char(40, 104)   # MOVD#2
+    prog[105] = encode_char(62, 105)   # CRZ#2
+    prog[106] = encode_char(40, 106)   # MOVD#3
+    prog[107] = encode_char(4, 107)    # JMP#2
 
-    # Cells executed in linear flow (must decode correctly)
-    prog[0]   = encode_char(23, 0)    # INPUT
-    prog[1]   = encode_char(4, 1)     # JMP#1 (always lands at 98)
-    prog[101] = encode_char(40, 101)  # MOVD#1
-    prog[102] = encode_char(62, 102)  # CRZ#1
-    prog[195] = encode_char(40, 195)  # MOVD#2
-    prog[196] = encode_char(62, 196)  # CRZ#2
-    prog[289] = encode_char(40, 289)  # MOVD#3
-    prog[290] = encode_char(4, 290)   # JMP#2
+    # Data cells inside the JMP-skipped region [2, 97]
+    prog[6]  = 33    # MOVD#1 reads here → d := 33, then +1 → 34
+    prog[34] = fb1   # CRZ#1/#2 flag cell
+    prog[35] = 33    # MOVD#2 and MOVD#3 read here
 
-    # Branch cells (executed post-JMP#2)
-    prog[pa]   = encode_char(5, pa)
-    prog[pa+1] = encode_char(81, pa+1)
-    prog[pb]   = encode_char(5, pb)
-    prog[pb+1] = encode_char(81, pb+1)
+    # Branch cells (post-JMP#2 lands at V_final+1)
+    for V in (V_X, V_Y):
+        prog[V + 1] = encode_char(5, V + 1)    # PRINT
+        prog[V + 2] = encode_char(81, V + 2)   # HALT
 
-    # Data cells (read by MOVD/CRZ)
-    prog[5]   = 33     # MOVD#1 data → redirects d to 34 (not XLAT'd: c≠5 in linear flow)
-    prog[34]  = fb1    # CRZ data; flag cell (not XLAT'd: c≠34 in linear flow)
-    # mem[127] IS visited as c in linear flow (in NOP region 103-194), so XLAT
-    # changes it. We need post-XLAT value = 33. XLAT['D'(68)] = '!'(33), so use 68.
-    prog[127] = 68     # MOVD#2 and MOVD#3 data: XLATs to 33 → redirects d to 34
-
-    # Sanity
-    for i, b in enumerate(prog):
-        assert 33 <= b <= 126, f"pos {i}: byte {b} out of range"
-
-    return bytes(prog), pa, pb
+    # Validate every byte against the spec loader check
+    for p, b in enumerate(prog):
+        if not is_valid_byte_at(b, p):
+            raise AssertionError(
+                f"pos {p}: byte {b} decodes to opcode "
+                f"{(b + p) % 94} (not a valid Malbolge Unshackled opcode)")
+    return bytes(prog)
 
 
 if __name__ == "__main__":
     sol = find_solution()
     if sol is None:
-        print("No solution")
+        print("No solution found")
         sys.exit(1)
     fb1, ix, iy, V_X, V_Y, ix_ch, iy_ch = sol
-    print(f"Solution: fb1={fb1} ('{chr(fb1)}'), input '{ix_ch}' ({ix}) → V_final={V_X} → branch at pos {V_X+1} (PRINT '{chr(V_X)}')")
-    print(f"          input '{iy_ch}' ({iy}) → V_final={V_Y} → branch at pos {V_Y+1} (PRINT '{chr(V_Y)}')")
+    print(f"Solution: fb1={fb1} ('{chr(fb1)}')")
+    print(f"  input '{ix_ch}' ({ix}) → V_final={V_X} → PRINT '{chr(V_X)}' at pos {V_X+1}")
+    print(f"  input '{iy_ch}' ({iy}) → V_final={V_Y} → PRINT '{chr(V_Y)}' at pos {V_Y+1}")
 
-    prog, pa, pb = build_program(fb1, ix, iy, V_X, V_Y)
-    out_path = '/tmp/branch/branch_v3.mu'
+    prog = build_program(fb1, V_X, V_Y)
+    out_path = '/home/markus/projects/malbolge_stuff/dotmu/branch_flag.mu'
     with open(out_path, 'wb') as f:
         f.write(prog)
     print(f"\nWrote {len(prog)} bytes to {out_path}")
 
-    print("\nSimulation:")
+    print("\nSimulation (word_sim):")
     for inp_ch, exp_ch in [(ix_ch, chr(V_X)), (iy_ch, chr(V_Y))]:
         out = simulate(prog, inp_ch.encode(), max_steps=2000)
-        status = '✓' if out == exp_ch.encode() else '✗'
-        print(f"  sim: '{inp_ch}' → {out!r}  (expected '{exp_ch}')  {status}")
+        ok = '✓' if out == exp_ch.encode() else '✗'
+        print(f"  '{inp_ch}' → {out!r}  (expected '{exp_ch}')  {ok}")
 
-    print("\nfast20:")
-    for inp_ch, exp_ch in [(ix_ch, chr(V_X)), (iy_ch, chr(V_Y))]:
-        res = subprocess.run(['/tmp/fast20', out_path], input=inp_ch.encode(), capture_output=True, timeout=10)
-        status = '✓' if res.stdout == exp_ch.encode() else '✗'
-        print(f"  fast20: '{inp_ch}' → {res.stdout!r}  (expected '{exp_ch}')  {status} exit={res.returncode}")
+    bins = [
+        ("fast20_malbolgelisp",
+         "/home/markus/projects/malbolge_stuff/interpreters/fast20/fast20_malbolgelisp"),
+        ("tio_unshackled",
+         "/home/markus/projects/malbolge_stuff/interpreters/tio_unshackled/unshackled"),
+        ("reference Haskell",
+         "/home/markus/projects/malbolge_stuff/interpreters/referenceImplementation/Unshackled"),
+    ]
+    for name, binp in bins:
+        print(f"\n{name}:")
+        for inp_ch, exp_ch in [(ix_ch, chr(V_X)), (iy_ch, chr(V_Y))]:
+            try:
+                res = subprocess.run([binp, out_path], input=inp_ch.encode(),
+                                     capture_output=True, timeout=15)
+                ok = '✓' if res.stdout == exp_ch.encode() else '✗'
+                print(f"  '{inp_ch}' → {res.stdout!r}  exit={res.returncode}  {ok}")
+            except subprocess.TimeoutExpired:
+                print(f"  '{inp_ch}' → TIMEOUT")
